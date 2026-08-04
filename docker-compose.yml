@@ -1,0 +1,61 @@
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: querylens-db
+    environment:
+      POSTGRES_DB: querylens
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_root_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d querylens"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: querylens-server
+    environment:
+      PORT: 5000
+      NODE_ENV: development
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: querylens
+      DATABASE_USER: querylens_app
+      DATABASE_PASSWORD: querylens_password
+      DATABASE_ADMIN_USER: querylens_admin
+      DATABASE_ADMIN_PASSWORD: querylens_admin_password
+      QUERY_TIMEOUT_MS: 5000
+      MAX_HISTORY_ITEMS: 100
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: querylens-client
+    environment:
+      VITE_PROXY_TARGET: http://server:5000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  pgdata:
