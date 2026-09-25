@@ -29,6 +29,15 @@ async function generateRecommendations(parsedPlan, findings, sql) {
   for (const node of allNodes) {
     // Only consider seq scans with filter conditions
     if (node.nodeType === 'Seq Scan' && node.filter) {
+      // Selectivity check: skip if the filter removes fewer rows than it keeps
+      const actualRows = node.actualRows * (node.actualLoops || 1);
+      const rowsRemoved = node.rowsRemovedByFilter * (node.actualLoops || 1);
+      const totalScanned = actualRows + rowsRemoved;
+      
+      if (totalScanned > 0 && rowsRemoved < actualRows) {
+        continue;
+      }
+
       const columns = extractColumnsFromCondition(node.filter);
       const tableName = node.relationName;
 
@@ -68,6 +77,58 @@ async function generateRecommendations(parsedPlan, findings, sql) {
           tradeOff: 'This index uses additional storage space and can slightly slow ' +
             'INSERT and UPDATE operations on this table.'
         });
+      }
+    }
+
+    // Consider Index Scans with high rows removed by filter (needs composite index)
+    const indexScanTypes = ['Index Scan', 'Bitmap Heap Scan'];
+    if (indexScanTypes.includes(node.nodeType) && node.filter) {
+      const actualRows = node.actualRows * (node.actualLoops || 1);
+      const rowsRemoved = node.rowsRemovedByFilter * (node.actualLoops || 1);
+      
+      // If it removed > 10x more rows than it returned, and > 1000 rows were removed
+      if (actualRows > 0 && rowsRemoved > actualRows * 10 && rowsRemoved > 1000) {
+        const filterColumns = extractColumnsFromCondition(node.filter);
+        const indexCondColumns = extractColumnsFromCondition(node.indexCondition || '');
+        const tableName = node.relationName;
+        
+        if (tableName && filterColumns.length > 0) {
+          // Combine existing indexed columns and the new filter columns
+          const compositeColumns = [...new Set([...indexCondColumns, ...filterColumns])];
+          
+          if (compositeColumns.length > 1) { // Ensure it's actually composite
+            let allColumnsExist = true;
+            for (const col of compositeColumns) {
+              if (!(await checkColumnExists(tableName, col))) {
+                allColumnsExist = false;
+                break;
+              }
+            }
+            
+            if (allColumnsExist && !hasExistingIndex(existingIndexes, tableName, compositeColumns)) {
+              const indexKey = `${tableName}.${compositeColumns.join('_')}`;
+              if (!seenIndexes.has(indexKey)) {
+                seenIndexes.add(indexKey);
+                
+                const indexName = generateIndexName(tableName, compositeColumns);
+                const quotedTable = quoteIdentifier(tableName);
+                const quotedColumns = compositeColumns.map(quoteIdentifier).join(', ');
+                const quotedIndexName = quoteIdentifier(indexName);
+                
+                recommendations.push({
+                  id: `rec-${recommendations.length + 1}`,
+                  table: tableName,
+                  columns: compositeColumns,
+                  indexName,
+                  sql: `CREATE INDEX ${quotedIndexName} ON ${quotedTable}(${quotedColumns});`,
+                  reason: `The query uses an index on "${tableName}" but still filters out ${rowsRemoved.toLocaleString()} rows after fetching them. A composite index covering all filter conditions can eliminate this overhead.`,
+                  confidence: 'high',
+                  tradeOff: 'Composite indexes use more storage and must be updated when any of the included columns change.'
+                });
+              }
+            }
+          }
+        }
       }
     }
 
